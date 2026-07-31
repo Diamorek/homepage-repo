@@ -1,0 +1,2014 @@
+import 'dart:async';
+import 'dart:convert';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+void main() {
+  runApp(const LabTimerApp());
+}
+
+class LabTimerApp extends StatelessWidget {
+  const LabTimerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '실험실 타이머',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: Colors.black,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.greenAccent,
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: const AppShell(),
+    );
+  }
+}
+
+/// 하단 탭으로 "타이머"와 "플레이트"를 오가는 셸
+class AppShell extends StatefulWidget {
+  const AppShell({super.key});
+
+  @override
+  State<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<AppShell> {
+  int tab = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: tab,
+        children: const [
+          TimerHomePage(),
+          PlateTrackerPage(),
+          CellCountPage(),
+          ReagentCalcPage(),
+          ProtocolListPage(),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        backgroundColor: const Color(0xFF111111),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.timer), label: '타이머'),
+          NavigationDestination(icon: Icon(Icons.grid_on), label: '플레이트'),
+          NavigationDestination(icon: Icon(Icons.bubble_chart), label: '셀카운트'),
+          NavigationDestination(icon: Icon(Icons.calculate), label: '시약계산'),
+          NavigationDestination(icon: Icon(Icons.checklist), label: '프로토콜'),
+        ],
+      ),
+    );
+  }
+}
+
+/// 채널 하나(T1~T4)의 상태
+class ChannelState {
+  bool running = false;
+  bool isCountdown = false; // false = 스탑워치(카운트업), true = 타이머(카운트다운)
+  int elapsedMs = 0; // 스탑워치 모드에서 흐른 시간
+  int setDurationMs = 0; // 타이머 모드에서 설정한 시간(원본)
+  int remainingMs = 0; // 타이머 모드에서 남은 시간
+  DateTime? lastTick; // 마지막으로 시간을 갱신한 시각
+  bool finished = false; // 타이머가 0에 도달했는지
+
+  int get displayMs => isCountdown ? remainingMs : elapsedMs;
+
+  void reset() {
+    running = false;
+    elapsedMs = 0;
+    remainingMs = setDurationMs;
+    finished = false;
+    lastTick = null;
+  }
+
+  Map<String, dynamic> toJson() => {
+        'running': running,
+        'isCountdown': isCountdown,
+        'elapsedMs': elapsedMs,
+        'setDurationMs': setDurationMs,
+        'remainingMs': remainingMs,
+      };
+
+  static ChannelState fromJson(Map<String, dynamic> json) {
+    final c = ChannelState();
+    c.running = false; // 앱을 다시 켰을 때는 항상 정지 상태로 불러옴 (안전)
+    c.isCountdown = json['isCountdown'] ?? false;
+    c.elapsedMs = json['elapsedMs'] ?? 0;
+    c.setDurationMs = json['setDurationMs'] ?? 0;
+    c.remainingMs = json['remainingMs'] ?? c.setDurationMs;
+    return c;
+  }
+}
+
+class TimerHomePage extends StatefulWidget {
+  const TimerHomePage({super.key});
+
+  @override
+  State<TimerHomePage> createState() => _TimerHomePageState();
+}
+
+class _TimerHomePageState extends State<TimerHomePage> {
+  final List<ChannelState> channels =
+      List.generate(4, (_) => ChannelState());
+  int selected = 0;
+  late Timer ticker;
+  DateTime now = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSaved();
+    // 0.1초마다 전체 채널 갱신 (실행 중인 채널만 시간이 흐름)
+    ticker = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      final t = DateTime.now();
+      setState(() {
+        now = t;
+        for (final c in channels) {
+          if (c.running && c.lastTick != null) {
+            final delta = t.difference(c.lastTick!).inMilliseconds;
+            c.lastTick = t;
+            if (c.isCountdown) {
+              c.remainingMs -= delta;
+              if (c.remainingMs <= 0) {
+                c.remainingMs = 0;
+                c.running = false;
+                if (!c.finished) {
+                  c.finished = true;
+                  _onTimerFinished();
+                }
+              }
+            } else {
+              c.elapsedMs += delta;
+            }
+          } else if (c.running) {
+            c.lastTick = t;
+          }
+        }
+      });
+    });
+  }
+
+  Future<void> _loadSaved() async {
+    final prefs = await SharedPreferences.getInstance();
+    for (int i = 0; i < 4; i++) {
+      final raw = prefs.getString('channel_$i');
+      if (raw != null) {
+        // 아주 단순한 저장 포맷: key=value;key=value
+        final map = <String, dynamic>{};
+        for (final pair in raw.split(';')) {
+          if (pair.isEmpty) continue;
+          final kv = pair.split('=');
+          if (kv.length != 2) continue;
+          final key = kv[0];
+          final val = kv[1];
+          if (key == 'isCountdown') {
+            map[key] = val == 'true';
+          } else {
+            map[key] = int.tryParse(val) ?? 0;
+          }
+        }
+        setState(() {
+          channels[i] = ChannelState.fromJson(map);
+        });
+      }
+    }
+  }
+
+  Future<void> _saveChannel(int index) async {
+    final prefs = await SharedPreferences.getInstance();
+    final c = channels[index];
+    final str = 'isCountdown=${c.isCountdown};elapsedMs=${c.elapsedMs};'
+        'setDurationMs=${c.setDurationMs};remainingMs=${c.remainingMs}';
+    await prefs.setString('channel_$index', str);
+  }
+
+  void _onTimerFinished() {
+    // 타이머 종료 시 알림음 + 진동성 피드백(플랫폼 기본 사운드)
+    SystemSound.play(SystemSoundType.alert);
+    HapticFeedback.vibrate();
+  }
+
+  @override
+  void dispose() {
+    ticker.cancel();
+    super.dispose();
+  }
+
+  ChannelState get current => channels[selected];
+
+  void _toggleStartStop() {
+    setState(() {
+      if (!current.running && current.isCountdown && current.remainingMs <= 0) {
+        // 다 끝난 타이머를 다시 시작하면 처음 설정값으로 리셋 후 시작
+        current.remainingMs = current.setDurationMs;
+        current.finished = false;
+      }
+      current.running = !current.running;
+      current.lastTick = current.running ? DateTime.now() : null;
+    });
+    _saveChannel(selected);
+  }
+
+  void _reset() {
+    setState(() {
+      current.reset();
+    });
+    _saveChannel(selected);
+  }
+
+  Future<void> _openSetTimeDialog() async {
+    final wasRunning = current.running;
+    if (wasRunning) {
+      setState(() => current.running = false);
+    }
+    final result = await showDialog<Duration>(
+      context: context,
+      builder: (context) => const _SetTimeDialog(),
+    );
+    if (result != null) {
+      setState(() {
+        // 모드 전환 시 이전 값이 남아있지 않도록 완전히 초기화
+        current.isCountdown = result.inMilliseconds > 0;
+        current.setDurationMs = result.inMilliseconds;
+        current.remainingMs = result.inMilliseconds;
+        current.elapsedMs = 0;
+        current.finished = false;
+        current.running = false;
+        current.lastTick = null;
+      });
+      _saveChannel(selected);
+    } else if (wasRunning) {
+      setState(() {
+        current.running = true;
+        current.lastTick = DateTime.now();
+      });
+    }
+  }
+
+  String _fmt(int ms, {bool withMillis = true}) {
+    if (ms < 0) ms = 0;
+    final h = ms ~/ 3600000;
+    final m = (ms % 3600000) ~/ 60000;
+    final s = (ms % 60000) ~/ 1000;
+    final cs = (ms % 1000) ~/ 10; // centisecond (00~99)
+    final hh = h.toString().padLeft(2, '0');
+    final mm = m.toString().padLeft(2, '0');
+    final ss = s.toString().padLeft(2, '0');
+    final ccss = cs.toString().padLeft(2, '0');
+    if (h > 0) {
+      return withMillis ? '$hh:$mm:$ss.$ccss' : '$hh:$mm:$ss';
+    }
+    return withMillis ? '$mm:$ss.$ccss' : '$mm:$ss';
+  }
+
+  String _fmtClock(DateTime t) {
+    return '${t.hour.toString().padLeft(2, '0')}:'
+        '${t.minute.toString().padLeft(2, '0')}:'
+        '${t.second.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = current;
+    final isRunning = c.running;
+    final isFinished = c.isCountdown && c.remainingMs <= 0 && !isRunning;
+
+    return Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            // 상단: 현재 시각
+            Padding(
+              padding: const EdgeInsets.only(top: 12, bottom: 4),
+              child: Text(
+                _fmtClock(now),
+                style: const TextStyle(
+                  fontSize: 28,
+                  color: Colors.grey,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                  fontWeight: FontWeight.w300,
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            // 채널 선택 탭 (T1~T4)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Row(
+                children: List.generate(4, (i) {
+                  final ch = channels[i];
+                  final isSel = i == selected;
+                  final chRunning = ch.running;
+                  return Expanded(
+                    child: GestureDetector(
+                      onTap: () => setState(() => selected = i),
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 4),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        decoration: BoxDecoration(
+                          color: isSel
+                              ? Colors.greenAccent.withOpacity(0.15)
+                              : Colors.grey.withOpacity(0.08),
+                          border: Border.all(
+                            color: isSel
+                                ? Colors.greenAccent
+                                : Colors.grey.shade800,
+                            width: isSel ? 2 : 1,
+                          ),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Column(
+                          children: [
+                            Text(
+                              'T${i + 1}',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                                color: isSel ? Colors.greenAccent : Colors.white70,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                if (chRunning)
+                                  Container(
+                                    width: 8,
+                                    height: 8,
+                                    margin: const EdgeInsets.only(right: 4),
+                                    decoration: const BoxDecoration(
+                                      color: Colors.redAccent,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                Text(
+                                  _fmt(ch.displayMs, withMillis: false),
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.white54,
+                                    fontFeatures: [FontFeature.tabularFigures()],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+            ),
+            const Spacer(),
+            // 메인 디스플레이 (크게)
+            Column(
+              children: [
+                Text(
+                  c.isCountdown ? '타이머 (T${selected + 1})' : '스탑워치 (T${selected + 1})',
+                  style: TextStyle(
+                    fontSize: 20,
+                    color: isFinished ? Colors.redAccent : Colors.grey,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                GestureDetector(
+                  onTap: _openSetTimeDialog,
+                  child: FittedBox(
+                    child: Text(
+                      _fmt(c.displayMs),
+                      style: TextStyle(
+                        fontSize: 96,
+                        fontWeight: FontWeight.bold,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                        color: isFinished
+                            ? Colors.redAccent
+                            : (isRunning ? Colors.greenAccent : Colors.white),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '숫자를 탭하면 시간 설정',
+                  style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+                ),
+              ],
+            ),
+            const Spacer(),
+            // 컨트롤 버튼
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 72,
+                      child: OutlinedButton(
+                        onPressed: _reset,
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: Colors.grey, width: 2),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: const Text('리셋',
+                            style: TextStyle(fontSize: 22, color: Colors.white70)),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    flex: 2,
+                    child: SizedBox(
+                      height: 72,
+                      child: ElevatedButton(
+                        onPressed: _toggleStartStop,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor:
+                              isRunning ? Colors.redAccent : Colors.greenAccent,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: Text(
+                          isRunning ? '정지' : (c.elapsedMs > 0 || c.remainingMs != c.setDurationMs ? '재개' : '시작'),
+                          style: const TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.black,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 시간 설정 다이얼로그 (타이머 모드로 전환할 때 사용)
+class _SetTimeDialog extends StatefulWidget {
+  const _SetTimeDialog();
+
+  @override
+  State<_SetTimeDialog> createState() => _SetTimeDialogState();
+}
+
+class _SetTimeDialogState extends State<_SetTimeDialog> {
+  int h = 0;
+  int m = 5;
+  int s = 0;
+
+  Widget _picker(String label, int value, int max, ValueChanged<int> onChanged) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(color: Colors.grey)),
+        SizedBox(
+          height: 100,
+          width: 70,
+          child: ListWheelScrollView.useDelegate(
+            itemExtent: 40,
+            perspective: 0.005,
+            diameterRatio: 1.2,
+            physics: const FixedExtentScrollPhysics(),
+            controller: FixedExtentScrollController(initialItem: value),
+            onSelectedItemChanged: onChanged,
+            childDelegate: ListWheelChildBuilderDelegate(
+              childCount: max,
+              builder: (context, index) => Center(
+                child: Text(
+                  index.toString().padLeft(2, '0'),
+                  style: const TextStyle(fontSize: 26, color: Colors.white),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: const Color(0xFF1a1a1a),
+      title: const Text('타이머 시간 설정', style: TextStyle(color: Colors.white)),
+      content: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _picker('시', h, 24, (v) => h = v),
+          const SizedBox(width: 8),
+          _picker('분', m, 60, (v) => m = v),
+          const SizedBox(width: 8),
+          _picker('초', s, 60, (v) => s = v),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, Duration.zero),
+          child: const Text('스탑워치로 사용 (시간 없음)'),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.pop(
+            context,
+            Duration(hours: h, minutes: m, seconds: s),
+          ),
+          child: const Text('설정'),
+        ),
+      ],
+    );
+  }
+}
+
+/// ===================== Plate 분주 위치 추적 =====================
+
+class PlateConfig {
+  final String name;
+  final int rows;
+  final int cols;
+  const PlateConfig(this.name, this.rows, this.cols);
+}
+
+const List<PlateConfig> kPlateConfigs = [
+  PlateConfig('6 Well', 2, 3),
+  PlateConfig('12 Well', 3, 4),
+  PlateConfig('24 Well', 4, 6),
+  PlateConfig('48 Well', 6, 8),
+  PlateConfig('96 Well', 8, 12),
+  PlateConfig('384 Well', 16, 24),
+];
+
+class PlateTrackerPage extends StatefulWidget {
+  const PlateTrackerPage({super.key});
+
+  @override
+  State<PlateTrackerPage> createState() => _PlateTrackerPageState();
+}
+
+class _PlateTrackerPageState extends State<PlateTrackerPage> {
+  int configIndex = 4; // 기본값 96 Well
+  Set<int> marked = {};
+  bool? dragSelecting; // 드래그 시작 시 "선택 모드"인지 "해제 모드"인지
+  Size? gridSize;
+
+  PlateConfig get config => kPlateConfigs[configIndex];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('plate_${config.name}');
+    setState(() {
+      marked = (raw == null || raw.isEmpty)
+          ? <int>{}
+          : raw.split(',').map(int.parse).toSet();
+    });
+  }
+
+  Future<void> _save() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('plate_${config.name}', marked.join(','));
+  }
+
+  void _handlePointer(Offset localPos) {
+    final size = gridSize;
+    if (size == null || size.width <= 0 || size.height <= 0) return;
+    final cellW = size.width / config.cols;
+    final cellH = size.height / config.rows;
+    if (localPos.dx < 0 ||
+        localPos.dy < 0 ||
+        localPos.dx >= size.width ||
+        localPos.dy >= size.height) {
+      return; // 그리드 영역 밖으로 손가락이 나가면 무시
+    }
+    final col = (localPos.dx / cellW).floor().clamp(0, config.cols - 1);
+    final row = (localPos.dy / cellH).floor().clamp(0, config.rows - 1);
+    final idx = row * config.cols + col;
+
+    dragSelecting ??= !marked.contains(idx);
+
+    setState(() {
+      if (dragSelecting == true) {
+        marked.add(idx);
+      } else {
+        marked.remove(idx);
+      }
+    });
+  }
+
+  void _endDrag() {
+    dragSelecting = null;
+    _save();
+  }
+
+  Future<void> _confirmReset() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1a1a1a),
+        title: const Text('전체 초기화', style: TextStyle(color: Colors.white)),
+        content: Text(
+          '${config.name} 플레이트의 선택을 모두 지울까요?',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('취소'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            child: const Text('초기화'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      setState(() => marked.clear());
+      _save();
+    }
+  }
+
+  String _rowLabel(int r) => String.fromCharCode(65 + r); // A, B, C ...
+
+  @override
+  Widget build(BuildContext context) {
+    const labelSize = 22.0;
+
+    return SafeArea(
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: Row(
+              children: [
+                const Text(
+                  'Plate 분주 위치',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const Spacer(),
+                DropdownButton<int>(
+                  value: configIndex,
+                  dropdownColor: const Color(0xFF1a1a1a),
+                  style: const TextStyle(color: Colors.greenAccent, fontSize: 16),
+                  underline: Container(height: 1, color: Colors.grey.shade700),
+                  items: [
+                    for (int i = 0; i < kPlateConfigs.length; i++)
+                      DropdownMenuItem(
+                        value: i,
+                        child: Text(kPlateConfigs[i].name),
+                      ),
+                  ],
+                  onChanged: (i) {
+                    if (i == null) return;
+                    setState(() => configIndex = i);
+                    _load();
+                  },
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                Text(
+                  '${marked.length} / ${config.rows * config.cols} 완료',
+                  style: const TextStyle(color: Colors.grey, fontSize: 14),
+                ),
+                const Spacer(),
+                TextButton.icon(
+                  onPressed: _confirmReset,
+                  icon: const Icon(Icons.refresh, color: Colors.redAccent, size: 18),
+                  label: const Text('초기화', style: TextStyle(color: Colors.redAccent)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Column(
+                children: [
+                  // 열 번호 헤더
+                  Row(
+                    children: [
+                      const SizedBox(width: labelSize),
+                      Expanded(
+                        child: Row(
+                          children: List.generate(
+                            config.cols,
+                            (c) => Expanded(
+                              child: Center(
+                                child: Text(
+                                  '${c + 1}',
+                                  style: const TextStyle(color: Colors.grey, fontSize: 11),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  // 행 라벨 + 그리드 본체
+                  Expanded(
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: labelSize,
+                          child: Column(
+                            children: List.generate(
+                              config.rows,
+                              (r) => Expanded(
+                                child: Center(
+                                  child: Text(
+                                    _rowLabel(r),
+                                    style: const TextStyle(color: Colors.grey, fontSize: 11),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onPanDown: (d) => _handlePointer(d.localPosition),
+                            onPanUpdate: (d) => _handlePointer(d.localPosition),
+                            onPanEnd: (_) => _endDrag(),
+                            onPanCancel: _endDrag,
+                            child: LayoutBuilder(
+                              builder: (context, constraints) {
+                                gridSize = Size(constraints.maxWidth, constraints.maxHeight);
+                                return GridView.builder(
+                                  physics: const NeverScrollableScrollPhysics(),
+                                  gridDelegate:
+                                      SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: config.cols,
+                                    childAspectRatio: 1,
+                                    mainAxisSpacing: 2,
+                                    crossAxisSpacing: 2,
+                                  ),
+                                  itemCount: config.rows * config.cols,
+                                  itemBuilder: (context, index) {
+                                    final isMarked = marked.contains(index);
+                                    return Container(
+                                      decoration: BoxDecoration(
+                                        color: isMarked
+                                            ? Colors.greenAccent
+                                            : Colors.grey.shade900,
+                                        border: Border.all(
+                                          color: Colors.grey.shade700,
+                                          width: 0.5,
+                                        ),
+                                        borderRadius: BorderRadius.circular(3),
+                                      ),
+                                    );
+                                  },
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// ===================== 시약 제조 계산기 =====================
+
+enum ConcUnit { M, mM, uM, nM }
+
+extension ConcUnitX on ConcUnit {
+  String get label {
+    switch (this) {
+      case ConcUnit.M:
+        return 'M';
+      case ConcUnit.mM:
+        return 'mM';
+      case ConcUnit.uM:
+        return 'µM';
+      case ConcUnit.nM:
+        return 'nM';
+    }
+  }
+
+  // 1 unit = X mol/L
+  double get toMolPerL {
+    switch (this) {
+      case ConcUnit.M:
+        return 1;
+      case ConcUnit.mM:
+        return 1e-3;
+      case ConcUnit.uM:
+        return 1e-6;
+      case ConcUnit.nM:
+        return 1e-9;
+    }
+  }
+}
+
+enum VolUnit { L, mL, uL }
+
+extension VolUnitX on VolUnit {
+  String get label {
+    switch (this) {
+      case VolUnit.L:
+        return 'L';
+      case VolUnit.mL:
+        return 'mL';
+      case VolUnit.uL:
+        return 'µL';
+    }
+  }
+
+  // 1 unit = X L
+  double get toL {
+    switch (this) {
+      case VolUnit.L:
+        return 1;
+      case VolUnit.mL:
+        return 1e-3;
+      case VolUnit.uL:
+        return 1e-6;
+    }
+  }
+}
+
+enum MassUnit { g, mg, ug }
+
+extension MassUnitX on MassUnit {
+  String get label {
+    switch (this) {
+      case MassUnit.g:
+        return 'g';
+      case MassUnit.mg:
+        return 'mg';
+      case MassUnit.ug:
+        return 'µg';
+    }
+  }
+
+  // 1 g = X of this unit
+  double get fromG {
+    switch (this) {
+      case MassUnit.g:
+        return 1;
+      case MassUnit.mg:
+        return 1e3;
+      case MassUnit.ug:
+        return 1e6;
+    }
+  }
+}
+
+class ReagentCalcPage extends StatefulWidget {
+  const ReagentCalcPage({super.key});
+
+  @override
+  State<ReagentCalcPage> createState() => _ReagentCalcPageState();
+}
+
+class _ReagentCalcPageState extends State<ReagentCalcPage> {
+  int mode = 0; // 0: 몰농도->질량, 1: 희석(C1V1=C2V2), 2: %농도->질량
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: Text(
+              '시약 제조 계산기',
+              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Wrap(
+              spacing: 8,
+              children: [
+                ChoiceChip(
+                  label: const Text('몰농도→질량'),
+                  selected: mode == 0,
+                  onSelected: (_) => setState(() => mode = 0),
+                ),
+                ChoiceChip(
+                  label: const Text('희석 (C1V1=C2V2)'),
+                  selected: mode == 1,
+                  onSelected: (_) => setState(() => mode = 1),
+                ),
+                ChoiceChip(
+                  label: const Text('%농도→질량'),
+                  selected: mode == 2,
+                  onSelected: (_) => setState(() => mode = 2),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16),
+              child: IndexedStack(
+                index: mode,
+                children: const [
+                  _MolarityToMassForm(),
+                  _DilutionForm(),
+                  _PercentToMassForm(),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 공통 입력 필드 위젯
+class _NumField extends StatelessWidget {
+  final String label;
+  final TextEditingController controller;
+  final ValueChanged<String> onChanged;
+  const _NumField({required this.label, required this.controller, required this.onChanged});
+
+  @override
+  Widget build(BuildContext context) {
+    return TextField(
+      controller: controller,
+      onChanged: onChanged,
+      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+      style: const TextStyle(color: Colors.white, fontSize: 18),
+      decoration: InputDecoration(
+        labelText: label,
+        labelStyle: const TextStyle(color: Colors.grey),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: BorderSide(color: Colors.grey.shade700),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(10),
+          borderSide: const BorderSide(color: Colors.greenAccent),
+        ),
+      ),
+    );
+  }
+}
+
+Widget _resultCard(String title, String value, {Color color = Colors.greenAccent}) {
+  return Container(
+    width: double.infinity,
+    margin: const EdgeInsets.only(top: 16),
+    padding: const EdgeInsets.all(16),
+    decoration: BoxDecoration(
+      color: color.withOpacity(0.1),
+      border: Border.all(color: color, width: 1.5),
+      borderRadius: BorderRadius.circular(12),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(title, style: const TextStyle(color: Colors.grey, fontSize: 13)),
+        const SizedBox(height: 4),
+        Text(
+          value,
+          style: TextStyle(color: color, fontSize: 28, fontWeight: FontWeight.bold),
+        ),
+      ],
+    ),
+  );
+}
+
+/// 1) 몰농도 -> 질량 : mass_g = C(mol/L) * V(L) * MW(g/mol)
+class _MolarityToMassForm extends StatefulWidget {
+  const _MolarityToMassForm();
+
+  @override
+  State<_MolarityToMassForm> createState() => _MolarityToMassFormState();
+}
+
+class _MolarityToMassFormState extends State<_MolarityToMassForm> {
+  final concCtrl = TextEditingController();
+  final volCtrl = TextEditingController();
+  final mwCtrl = TextEditingController();
+  ConcUnit concUnit = ConcUnit.mM;
+  VolUnit volUnit = VolUnit.mL;
+  MassUnit massUnit = MassUnit.mg;
+
+  double? get result {
+    final c = double.tryParse(concCtrl.text);
+    final v = double.tryParse(volCtrl.text);
+    final mw = double.tryParse(mwCtrl.text);
+    if (c == null || v == null || mw == null) return null;
+    final massG = c * concUnit.toMolPerL * v * volUnit.toL * mw;
+    return massG * massUnit.fromG;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          '목표 몰농도 × 부피 × 분자량 = 필요한 질량',
+          style: TextStyle(color: Colors.grey, fontSize: 13),
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              flex: 2,
+              child: _NumField(label: '목표 농도', controller: concCtrl, onChanged: (_) => setState(() {})),
+            ),
+            const SizedBox(width: 8),
+            _UnitDropdown<ConcUnit>(
+              value: concUnit,
+              items: ConcUnit.values,
+              labelOf: (u) => u.label,
+              onChanged: (u) => setState(() => concUnit = u),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              flex: 2,
+              child: _NumField(label: '최종 부피', controller: volCtrl, onChanged: (_) => setState(() {})),
+            ),
+            const SizedBox(width: 8),
+            _UnitDropdown<VolUnit>(
+              value: volUnit,
+              items: VolUnit.values,
+              labelOf: (u) => u.label,
+              onChanged: (u) => setState(() => volUnit = u),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        _NumField(label: '분자량 (g/mol)', controller: mwCtrl, onChanged: (_) => setState(() {})),
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerRight,
+          child: _UnitDropdown<MassUnit>(
+            value: massUnit,
+            items: MassUnit.values,
+            labelOf: (u) => '결과 단위: ${u.label}',
+            onChanged: (u) => setState(() => massUnit = u),
+          ),
+        ),
+        if (result != null)
+          _resultCard('필요한 질량', '${_fmtNum(result!)} ${massUnit.label}'),
+      ],
+    );
+  }
+}
+
+/// 2) 희석 계산 C1V1 = C2V2  -> V1 = C2*V2 / C1
+class _DilutionForm extends StatefulWidget {
+  const _DilutionForm();
+
+  @override
+  State<_DilutionForm> createState() => _DilutionFormState();
+}
+
+class _DilutionFormState extends State<_DilutionForm> {
+  final c1Ctrl = TextEditingController();
+  final c2Ctrl = TextEditingController();
+  final v2Ctrl = TextEditingController();
+  VolUnit v2Unit = VolUnit.mL;
+
+  // C1, C2는 같은 단위(배수 등)이기만 하면 되므로 단위 변환 없이 그대로 비율 계산
+  double? get v1 {
+    final c1 = double.tryParse(c1Ctrl.text);
+    final c2 = double.tryParse(c2Ctrl.text);
+    final v2 = double.tryParse(v2Ctrl.text);
+    if (c1 == null || c2 == null || v2 == null || c1 == 0) return null;
+    return c2 * v2 / c1;
+  }
+
+  double? get diluent {
+    final v2 = double.tryParse(v2Ctrl.text);
+    final vv1 = v1;
+    if (v2 == null || vv1 == null) return null;
+    return v2 - vv1;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'C1 × V1 = C2 × V2  (C1, C2는 같은 농도 단위로 입력: 예) 둘 다 M, 둘 다 배수(x)',
+          style: TextStyle(color: Colors.grey, fontSize: 13),
+        ),
+        const SizedBox(height: 12),
+        _NumField(label: '원액 농도 (C1)', controller: c1Ctrl, onChanged: (_) => setState(() {})),
+        const SizedBox(height: 12),
+        _NumField(label: '목표 농도 (C2)', controller: c2Ctrl, onChanged: (_) => setState(() {})),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              flex: 2,
+              child: _NumField(label: '최종 부피 (V2)', controller: v2Ctrl, onChanged: (_) => setState(() {})),
+            ),
+            const SizedBox(width: 8),
+            _UnitDropdown<VolUnit>(
+              value: v2Unit,
+              items: VolUnit.values,
+              labelOf: (u) => u.label,
+              onChanged: (u) => setState(() => v2Unit = u),
+            ),
+          ],
+        ),
+        if (v1 != null && diluent != null) ...[
+          _resultCard('원액 (C1) 필요량', '${_fmtNum(v1!)} ${v2Unit.label}'),
+          _resultCard('추가할 용매(희석액)', '${_fmtNum(diluent!)} ${v2Unit.label}', color: Colors.lightBlueAccent),
+        ],
+      ],
+    );
+  }
+}
+
+/// 3) %농도(w/v) -> 질량 : %w/v = g / 100mL  ->  mass_g = percent * volume_mL / 100
+class _PercentToMassForm extends StatefulWidget {
+  const _PercentToMassForm();
+
+  @override
+  State<_PercentToMassForm> createState() => _PercentToMassFormState();
+}
+
+class _PercentToMassFormState extends State<_PercentToMassForm> {
+  final percentCtrl = TextEditingController();
+  final volCtrl = TextEditingController();
+  VolUnit volUnit = VolUnit.mL;
+  MassUnit massUnit = MassUnit.g;
+
+  double? get result {
+    final p = double.tryParse(percentCtrl.text);
+    final v = double.tryParse(volCtrl.text);
+    if (p == null || v == null) return null;
+    final volumeMl = v * volUnit.toL * 1000;
+    final massG = p * volumeMl / 100;
+    return massG * massUnit.fromG;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          '%w/v 기준: 목표 % × 최종 부피 = 필요한 질량 (g/100mL 기준)',
+          style: TextStyle(color: Colors.grey, fontSize: 13),
+        ),
+        const SizedBox(height: 12),
+        _NumField(label: '목표 농도 (% w/v)', controller: percentCtrl, onChanged: (_) => setState(() {})),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(
+              flex: 2,
+              child: _NumField(label: '최종 부피', controller: volCtrl, onChanged: (_) => setState(() {})),
+            ),
+            const SizedBox(width: 8),
+            _UnitDropdown<VolUnit>(
+              value: volUnit,
+              items: VolUnit.values,
+              labelOf: (u) => u.label,
+              onChanged: (u) => setState(() => volUnit = u),
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Align(
+          alignment: Alignment.centerRight,
+          child: _UnitDropdown<MassUnit>(
+            value: massUnit,
+            items: MassUnit.values,
+            labelOf: (u) => '결과 단위: ${u.label}',
+            onChanged: (u) => setState(() => massUnit = u),
+          ),
+        ),
+        if (result != null)
+          _resultCard('필요한 질량', '${_fmtNum(result!)} ${massUnit.label}'),
+      ],
+    );
+  }
+}
+
+class _UnitDropdown<T> extends StatelessWidget {
+  final T value;
+  final List<T> items;
+  final String Function(T) labelOf;
+  final ValueChanged<T> onChanged;
+  const _UnitDropdown({
+    required this.value,
+    required this.items,
+    required this.labelOf,
+    required this.onChanged,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return DropdownButton<T>(
+      value: value,
+      dropdownColor: const Color(0xFF1a1a1a),
+      style: const TextStyle(color: Colors.greenAccent, fontSize: 14),
+      underline: Container(height: 1, color: Colors.grey.shade700),
+      items: [
+        for (final it in items) DropdownMenuItem(value: it, child: Text(labelOf(it))),
+      ],
+      onChanged: (v) {
+        if (v != null) onChanged(v);
+      },
+    );
+  }
+}
+
+String _fmtNum(double v) {
+  if (v == 0) return '0';
+  final absV = v.abs();
+  // 아주 작거나 큰 값은 지수 표기, 그 외엔 유효숫자 4자리 정도로 표시
+  if (absV < 0.0001 || absV >= 1000000) {
+    return v.toStringAsExponential(3);
+  }
+  String s = v.toStringAsFixed(v.abs() < 1 ? 6 : 4);
+  // 뒤에 붙는 불필요한 0 제거
+  s = s.replaceAll(RegExp(r'0+$'), '');
+  s = s.replaceAll(RegExp(r'\.$'), '');
+  return s;
+}
+
+/// ===================== 프로토콜 기록 =====================
+
+class ProtocolStep {
+  String text;
+  bool done;
+  DateTime? completedAt;
+  ProtocolStep({required this.text, this.done = false, this.completedAt});
+
+  Map<String, dynamic> toJson() => {
+        'text': text,
+        'done': done,
+        'completedAt': completedAt?.toIso8601String(),
+      };
+
+  static ProtocolStep fromJson(Map<String, dynamic> j) => ProtocolStep(
+        text: j['text'] ?? '',
+        done: j['done'] ?? false,
+        completedAt:
+            j['completedAt'] != null ? DateTime.tryParse(j['completedAt']) : null,
+      );
+}
+
+class LabProtocol {
+  String id;
+  String name;
+  List<ProtocolStep> steps;
+  LabProtocol({required this.id, required this.name, required this.steps});
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'name': name,
+        'steps': steps.map((s) => s.toJson()).toList(),
+      };
+
+  static LabProtocol fromJson(Map<String, dynamic> j) => LabProtocol(
+        id: j['id'],
+        name: j['name'],
+        steps: (j['steps'] as List)
+            .map((e) => ProtocolStep.fromJson(e as Map<String, dynamic>))
+            .toList(),
+      );
+}
+
+String _fmtDateTime(DateTime? dt) {
+  if (dt == null) return '';
+  return '${dt.month}/${dt.day} '
+      '${dt.hour.toString().padLeft(2, '0')}:'
+      '${dt.minute.toString().padLeft(2, '0')}:'
+      '${dt.second.toString().padLeft(2, '0')}';
+}
+
+Future<void> _shareProtocolViaEmail(BuildContext context, LabProtocol protocol) async {
+  final buffer = StringBuffer();
+  buffer.writeln('실험 프로토콜: ${protocol.name}');
+  buffer.writeln('');
+  for (final s in protocol.steps) {
+    final status = s.done ? '완료 (${_fmtDateTime(s.completedAt)})' : '미완료';
+    buffer.writeln('- ${s.text} : $status');
+  }
+  final uri = Uri(
+    scheme: 'mailto',
+    query: 'subject=${Uri.encodeComponent('실험 프로토콜 기록: ${protocol.name}')}'
+        '&body=${Uri.encodeComponent(buffer.toString())}',
+  );
+  final can = await canLaunchUrl(uri);
+  if (can) {
+    await launchUrl(uri);
+  } else if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('메일 앱을 열 수 없어요. 이 기기에 메일 앱이 설정되어 있는지 확인해주세요.'),
+      ),
+    );
+  }
+}
+
+class ProtocolListPage extends StatefulWidget {
+  const ProtocolListPage({super.key});
+
+  @override
+  State<ProtocolListPage> createState() => _ProtocolListPageState();
+}
+
+class _ProtocolListPageState extends State<ProtocolListPage> {
+  List<LabProtocol> protocols = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('protocols');
+    if (raw != null && raw.isNotEmpty) {
+      final list = (jsonDecode(raw) as List)
+          .map((e) => LabProtocol.fromJson(e as Map<String, dynamic>))
+          .toList();
+      setState(() => protocols = list);
+    }
+  }
+
+  Future<void> _persist() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      'protocols',
+      jsonEncode(protocols.map((p) => p.toJson()).toList()),
+    );
+  }
+
+  Future<void> _createNew() async {
+    final result = await Navigator.of(context).push<LabProtocol>(
+      MaterialPageRoute(builder: (_) => const ProtocolEditorPage()),
+    );
+    if (result != null) {
+      setState(() => protocols.add(result));
+      _persist();
+    }
+  }
+
+  Future<void> _edit(LabProtocol p) async {
+    final result = await Navigator.of(context).push<LabProtocol>(
+      MaterialPageRoute(builder: (_) => ProtocolEditorPage(existing: p)),
+    );
+    if (result != null) {
+      setState(() {
+        final idx = protocols.indexWhere((e) => e.id == p.id);
+        if (idx != -1) protocols[idx] = result;
+      });
+      _persist();
+    }
+  }
+
+  Future<void> _confirmDelete(LabProtocol p) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1a1a1a),
+        title: const Text('프로토콜 삭제', style: TextStyle(color: Colors.white)),
+        content: Text('"${p.name}"을(를) 삭제할까요?', style: const TextStyle(color: Colors.white70)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context, false), child: const Text('취소')),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            child: const Text('삭제'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      setState(() => protocols.removeWhere((e) => e.id == p.id));
+      _persist();
+    }
+  }
+
+  Future<void> _run(LabProtocol p) async {
+    final updated = await Navigator.of(context).push<LabProtocol>(
+      MaterialPageRoute(builder: (_) => ProtocolRunPage(protocol: p)),
+    );
+    if (updated != null) {
+      setState(() {
+        final idx = protocols.indexWhere((e) => e.id == p.id);
+        if (idx != -1) protocols[idx] = updated;
+      });
+      _persist();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: Row(
+              children: [
+                const Text(
+                  '프로토콜',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white),
+                ),
+                const Spacer(),
+                ElevatedButton.icon(
+                  onPressed: _createNew,
+                  icon: const Icon(Icons.add, size: 18),
+                  label: const Text('새로 만들기'),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.greenAccent,
+                    foregroundColor: Colors.black,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: protocols.isEmpty
+                ? Center(
+                    child: Text(
+                      '저장된 프로토콜이 없어요.\n"새로 만들기"로 시작해보세요.',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: Colors.grey.shade600),
+                    ),
+                  )
+                : ListView.builder(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    itemCount: protocols.length,
+                    itemBuilder: (context, i) {
+                      final p = protocols[i];
+                      final doneCount = p.steps.where((s) => s.done).length;
+                      return Card(
+                        color: const Color(0xFF1a1a1a),
+                        margin: const EdgeInsets.only(bottom: 10),
+                        child: ListTile(
+                          title: Text(p.name,
+                              style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+                          subtitle: Text('$doneCount / ${p.steps.length} 완료',
+                              style: const TextStyle(color: Colors.grey)),
+                          onTap: () => _run(p),
+                          trailing: PopupMenuButton<String>(
+                            color: const Color(0xFF1a1a1a),
+                            icon: const Icon(Icons.more_vert, color: Colors.grey),
+                            onSelected: (v) {
+                              if (v == 'edit') _edit(p);
+                              if (v == 'delete') _confirmDelete(p);
+                              if (v == 'share') _shareProtocolViaEmail(context, p);
+                            },
+                            itemBuilder: (context) => const [
+                              PopupMenuItem(value: 'edit', child: Text('수정')),
+                              PopupMenuItem(value: 'share', child: Text('Gmail로 공유')),
+                              PopupMenuItem(value: 'delete', child: Text('삭제')),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class ProtocolEditorPage extends StatefulWidget {
+  final LabProtocol? existing;
+  const ProtocolEditorPage({super.key, this.existing});
+
+  @override
+  State<ProtocolEditorPage> createState() => _ProtocolEditorPageState();
+}
+
+class _ProtocolEditorPageState extends State<ProtocolEditorPage> {
+  late TextEditingController nameCtrl;
+  late List<TextEditingController> stepCtrls;
+
+  @override
+  void initState() {
+    super.initState();
+    nameCtrl = TextEditingController(text: widget.existing?.name ?? '');
+    if (widget.existing != null) {
+      stepCtrls = widget.existing!.steps.map((s) => TextEditingController(text: s.text)).toList();
+    } else {
+      stepCtrls = List.generate(5, (_) => TextEditingController()); // 기본 5칸 (5~7단계 권장)
+    }
+  }
+
+  void _addStep() {
+    if (stepCtrls.length >= 15) return;
+    setState(() => stepCtrls.add(TextEditingController()));
+  }
+
+  void _removeStep(int i) {
+    if (stepCtrls.length <= 1) return;
+    setState(() {
+      stepCtrls[i].dispose();
+      stepCtrls.removeAt(i);
+    });
+  }
+
+  void _save() {
+    final name = nameCtrl.text.trim();
+    if (name.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('프로토콜 이름을 입력해주세요.')),
+      );
+      return;
+    }
+    final steps = <ProtocolStep>[];
+    for (int i = 0; i < stepCtrls.length; i++) {
+      final text = stepCtrls[i].text.trim();
+      if (text.isEmpty) continue;
+      // 수정 시 기존 완료 상태/시각 유지
+      final prev = (widget.existing != null && i < widget.existing!.steps.length)
+          ? widget.existing!.steps[i]
+          : null;
+      steps.add(ProtocolStep(text: text, done: prev?.done ?? false, completedAt: prev?.completedAt));
+    }
+    if (steps.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('절차를 하나 이상 입력해주세요.')),
+      );
+      return;
+    }
+    final protocol = LabProtocol(
+      id: widget.existing?.id ?? DateTime.now().millisecondsSinceEpoch.toString(),
+      name: name,
+      steps: steps,
+    );
+    Navigator.of(context).pop(protocol);
+  }
+
+  @override
+  void dispose() {
+    nameCtrl.dispose();
+    for (final c in stepCtrls) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Colors.black,
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF111111),
+        title: Text(widget.existing == null ? '새 프로토콜' : '프로토콜 수정'),
+        actions: [
+          TextButton(
+            onPressed: _save,
+            child: const Text('저장', style: TextStyle(color: Colors.greenAccent)),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(16),
+          children: [
+            TextField(
+              controller: nameCtrl,
+              style: const TextStyle(color: Colors.white, fontSize: 18),
+              decoration: InputDecoration(
+                labelText: '프로토콜 이름',
+                labelStyle: const TextStyle(color: Colors.grey),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: Colors.grey.shade700),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: const BorderSide(color: Colors.greenAccent),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Text('절차 (보통 5~7단계 정도가 적당해요)',
+                style: TextStyle(color: Colors.grey, fontSize: 13)),
+            const SizedBox(height: 8),
+            for (int i = 0; i < stepCtrls.length; i++)
+              Padding(
+                padding: const EdgeInsets.only(bottom: 10),
+                child: Row(
+                  children: [
+                    SizedBox(width: 28, child: Text('${i + 1}.', style: const TextStyle(color: Colors.grey))),
+                    Expanded(
+                      child: TextField(
+                        controller: stepCtrls[i],
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: '${i + 1}번째 절차 입력',
+                          hintStyle: TextStyle(color: Colors.grey.shade700),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            borderSide: BorderSide(color: Colors.grey.shade800),
+                          ),
+                          focusedBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(8),
+                            borderSide: const BorderSide(color: Colors.greenAccent),
+                          ),
+                          isDense: true,
+                        ),
+                      ),
+                    ),
+                    IconButton(
+                      onPressed: stepCtrls.length > 1 ? () => _removeStep(i) : null,
+                      icon: const Icon(Icons.remove_circle_outline, color: Colors.redAccent),
+                    ),
+                  ],
+                ),
+              ),
+            TextButton.icon(
+              onPressed: _addStep,
+              icon: const Icon(Icons.add, color: Colors.greenAccent),
+              label: const Text('절차 추가', style: TextStyle(color: Colors.greenAccent)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class ProtocolRunPage extends StatefulWidget {
+  final LabProtocol protocol;
+  const ProtocolRunPage({super.key, required this.protocol});
+
+  @override
+  State<ProtocolRunPage> createState() => _ProtocolRunPageState();
+}
+
+class _ProtocolRunPageState extends State<ProtocolRunPage> {
+  late LabProtocol protocol;
+
+  @override
+  void initState() {
+    super.initState();
+    // 원본을 직접 건드리지 않도록 깊은 복사
+    protocol = LabProtocol(
+      id: widget.protocol.id,
+      name: widget.protocol.name,
+      steps: widget.protocol.steps
+          .map((s) => ProtocolStep(text: s.text, done: s.done, completedAt: s.completedAt))
+          .toList(),
+    );
+  }
+
+  void _toggle(int i) {
+    setState(() {
+      final s = protocol.steps[i];
+      if (s.done) {
+        s.done = false;
+        s.completedAt = null;
+      } else {
+        s.done = true;
+        s.completedAt = DateTime.now();
+      }
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final doneCount = protocol.steps.where((s) => s.done).length;
+    return WillPopScope(
+      onWillPop: () async {
+        Navigator.of(context).pop(protocol);
+        return false;
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        appBar: AppBar(
+          backgroundColor: const Color(0xFF111111),
+          title: Text(protocol.name),
+          leading: IconButton(
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () => Navigator.of(context).pop(protocol),
+          ),
+          actions: [
+            IconButton(
+              onPressed: () => _shareProtocolViaEmail(context, protocol),
+              icon: const Icon(Icons.share),
+              tooltip: 'Gmail로 공유',
+            ),
+          ],
+        ),
+        body: SafeArea(
+          child: Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.all(16),
+                child: Text('$doneCount / ${protocol.steps.length} 완료',
+                    style: const TextStyle(color: Colors.grey, fontSize: 14)),
+              ),
+              Expanded(
+                child: ListView.builder(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  itemCount: protocol.steps.length,
+                  itemBuilder: (context, i) {
+                    final s = protocol.steps[i];
+                    return Card(
+                      color: s.done ? Colors.greenAccent.withOpacity(0.12) : const Color(0xFF1a1a1a),
+                      margin: const EdgeInsets.only(bottom: 10),
+                      child: ListTile(
+                        onTap: () => _toggle(i),
+                        leading: Icon(
+                          s.done ? Icons.check_circle : Icons.radio_button_unchecked,
+                          color: s.done ? Colors.greenAccent : Colors.grey,
+                          size: 32,
+                        ),
+                        title: Text(
+                          s.text,
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            decoration: s.done ? TextDecoration.lineThrough : null,
+                          ),
+                        ),
+                        subtitle: s.done
+                            ? Text(_fmtDateTime(s.completedAt), style: const TextStyle(color: Colors.greenAccent))
+                            : null,
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// ===================== 셀 카운트 =====================
+
+class CellCountPage extends StatefulWidget {
+  const CellCountPage({super.key});
+
+  @override
+  State<CellCountPage> createState() => _CellCountPageState();
+}
+
+class _CellCountPageState extends State<CellCountPage> {
+  int count = 0;
+  bool showCalc = false;
+  int lockedCount = 0;
+
+  final squaresCtrl = TextEditingController(text: '4');
+  final dilutionCtrl = TextEditingController(text: '2');
+  final targetConcCtrl = TextEditingController();
+  final targetVolCtrl = TextEditingController();
+  VolUnit targetVolUnit = VolUnit.mL;
+
+  void _increment() => setState(() => count++);
+  void _reset() => setState(() => count = 0);
+
+  void _goToCalc() {
+    setState(() {
+      lockedCount = count;
+      showCalc = true;
+    });
+  }
+
+  void _backToCount() => setState(() => showCalc = false);
+
+  // 혈구계산판 표준 공식: (카운트된 세포 수 / 계산한 칸 수) × 희석배수 × 10^4 = cells/mL
+  double? get concentration {
+    final squares = double.tryParse(squaresCtrl.text);
+    final dilution = double.tryParse(dilutionCtrl.text);
+    if (squares == null || squares == 0 || dilution == null) return null;
+    return (lockedCount / squares) * dilution * 1e4;
+  }
+
+  double? get v1 {
+    final c1 = concentration;
+    final c2 = double.tryParse(targetConcCtrl.text);
+    final v2 = double.tryParse(targetVolCtrl.text);
+    if (c1 == null || c1 == 0 || c2 == null || v2 == null) return null;
+    return c2 * v2 / c1;
+  }
+
+  double? get diluent {
+    final v2 = double.tryParse(targetVolCtrl.text);
+    final vv1 = v1;
+    if (v2 == null || vv1 == null) return null;
+    return v2 - vv1;
+  }
+
+  @override
+  void dispose() {
+    squaresCtrl.dispose();
+    dilutionCtrl.dispose();
+    targetConcCtrl.dispose();
+    targetVolCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return SafeArea(child: showCalc ? _buildCalc() : _buildCounter());
+  }
+
+  Widget _buildCounter() {
+    return Column(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+          child: Row(
+            children: [
+              const Text('셀 카운트',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
+              const Spacer(),
+              TextButton.icon(
+                onPressed: _reset,
+                icon: const Icon(Icons.refresh, color: Colors.redAccent),
+                label: const Text('초기화', style: TextStyle(color: Colors.redAccent)),
+              ),
+            ],
+          ),
+        ),
+        const Spacer(),
+        FittedBox(
+          child: Text(
+            '$count',
+            style: const TextStyle(
+              fontSize: 140,
+              fontWeight: FontWeight.bold,
+              color: Colors.greenAccent,
+              fontFeatures: [FontFeature.tabularFigures()],
+            ),
+          ),
+        ),
+        Text('탭한 횟수 = 카운트된 세포 수', style: TextStyle(color: Colors.grey.shade500)),
+        const Spacer(),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
+          child: Column(
+            children: [
+              SizedBox(
+                width: double.infinity,
+                height: 140,
+                child: ElevatedButton(
+                  onPressed: _increment,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.greenAccent,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+                  ),
+                  child: const Text('탭하여 카운트 +1',
+                      style: TextStyle(fontSize: 26, fontWeight: FontWeight.bold, color: Colors.black)),
+                ),
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                height: 60,
+                child: OutlinedButton(
+                  onPressed: count > 0 ? _goToCalc : null,
+                  style: OutlinedButton.styleFrom(
+                    side: const BorderSide(color: Colors.greenAccent, width: 2),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                  ),
+                  child: const Text('계산하기 →', style: TextStyle(fontSize: 20, color: Colors.greenAccent)),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildCalc() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              IconButton(
+                onPressed: _backToCount,
+                icon: const Icon(Icons.arrow_back, color: Colors.white),
+              ),
+              const Text('세포 농도 계산',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.white)),
+            ],
+          ),
+          _resultCard('카운트된 세포 수', '$lockedCount 개', color: Colors.white),
+          const SizedBox(height: 20),
+          const Text('현재 농도 계산', style: TextStyle(color: Colors.grey, fontSize: 13)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              Expanded(
+                child: _NumField(
+                  label: '계산한 칸 수',
+                  controller: squaresCtrl,
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: _NumField(
+                  label: '희석 배수',
+                  controller: dilutionCtrl,
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+            ],
+          ),
+          if (concentration != null)
+            _resultCard('현재 세포 농도', '${_fmtNum(concentration!)} cells/mL'),
+          const SizedBox(height: 24),
+          const Text('목표 농도로 희석하기', style: TextStyle(color: Colors.grey, fontSize: 13)),
+          const SizedBox(height: 8),
+          _NumField(
+            label: '목표 농도 (cells/mL)',
+            controller: targetConcCtrl,
+            onChanged: (_) => setState(() {}),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                flex: 2,
+                child: _NumField(
+                  label: '목표 최종 부피',
+                  controller: targetVolCtrl,
+                  onChanged: (_) => setState(() {}),
+                ),
+              ),
+              const SizedBox(width: 8),
+              _UnitDropdown<VolUnit>(
+                value: targetVolUnit,
+                items: VolUnit.values,
+                labelOf: (u) => u.label,
+                onChanged: (u) => setState(() => targetVolUnit = u),
+              ),
+            ],
+          ),
+          if (v1 != null && diluent != null) ...[
+            _resultCard('필요한 세포 현탁액 부피', '${_fmtNum(v1!)} ${targetVolUnit.label}'),
+            _resultCard('추가할 배지(희석액)', '${_fmtNum(diluent!)} ${targetVolUnit.label}',
+                color: Colors.lightBlueAccent),
+          ],
+        ],
+      ),
+    );
+  }
+}
