@@ -1,0 +1,803 @@
+import 'dart:async';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  runApp(const LabTimerApp());
+}
+
+class LabTimerApp extends StatelessWidget {
+  const LabTimerApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: '실험실 타이머',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: Colors.black,
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: Colors.greenAccent,
+          brightness: Brightness.dark,
+        ),
+      ),
+      home: const AppShell(),
+    );
+  }
+}
+
+/// 하단 탭으로 "타이머"와 "플레이트"를 오가는 셸
+class AppShell extends StatefulWidget {
+  const AppShell({super.key});
+
+  @override
+  State<AppShell> createState() => _AppShellState();
+}
+
+class _AppShellState extends State<AppShell> {
+  int tab = 0;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: IndexedStack(
+        index: tab,
+        children: const [
+          TimerHomePage(),
+          PlateTrackerPage(),
+        ],
+      ),
+      bottomNavigationBar: NavigationBar(
+        selectedIndex: tab,
+        onDestinationSelected: (i) => setState(() => tab = i),
+        backgroundColor: const Color(0xFF111111),
+        destinations: const [
+          NavigationDestination(icon: Icon(Icons.timer), label: '타이머'),
+          NavigationDestination(icon: Icon(Icons.grid_on), label: '플레이트'),
+        ],
+      ),
+    );
+  }
+}
+
+/// 채널 하나(T1~T4)의 상태
+class ChannelState {
+  bool running = false;
+  bool isCountdown = false; // false = 스탑워치(카운트업), true = 타이머(카운트다운)
+  int elapsedMs = 0; // 스탑워치 모드에서 흐른 시간
+  int setDurationMs = 0; // 타이머 모드에서 설정한 시간(원본)
+  int remainingMs = 0; // 타이머 모드에서 남은 시간
+  DateTime? lastTick; // 마지막으로 시간을 갱신한 시각
+  bool finished = false; // 타이머가 0에 도달했는지
+
+  int get displayMs => isCountdown ? remainingMs : elapsedMs;
+
+  void reset() {
+    running = false;
+    elapsedMs = 0;
+    remainingMs = setDurationMs;
+    finished = false;
+    lastTick = null;
+  }
+
+  Map<String, dynamic> toJson() => {
+        'running': running,
+        'isCountdown': isCountdown,
+        'elapsedMs': elapsedMs,
+        'setDurationMs': setDurationMs,
+        'remainingMs': remainingMs,
+      };
+
+  static ChannelState fromJson(Map<String, dynamic> json) {
+    final c = ChannelState();
+    c.running = false; // 앱을 다시 켰을 때는 항상 정지 상태로 불러옴 (안전)
+    c.isCountdown = json['isCountdown'] ?? false;
+    c.elapsedMs = json['elapsedMs'] ?? 0;
+    c.setDurationMs = json['setDurationMs'] ?? 0;
+    c.remainingMs = json['remainingMs'] ?? c.setDurationMs;
+    return c;
+  }
+}
+
+class TimerHomePage extends StatefulWidget {
+  const TimerHomePage({super.key});
+
+  @override
+  State<TimerHomePage> createState() => _TimerHomePageState();
+}
+
+class _TimerHomePageState extends State<TimerHomePage> {
+  final List<ChannelState> channels =
+      List.generate(4, (_) => ChannelState());
+  int selected = 0;
+  late Timer ticker;
+  DateTime now = DateTime.now();
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSaved();
+    // 0.1초마다 전체 채널 갱신 (실행 중인 채널만 시간이 흐름)
+    ticker = Timer.periodic(const Duration(milliseconds: 100), (_) {
+      final t = DateTime.now();
+      setState(() {
+        now = t;
+        for (final c in channels) {
+          if (c.running && c.lastTick != null) {
+            final delta = t.difference(c.lastTick!).inMilliseconds;
+            c.lastTick = t;
+            if (c.isCountdown) {
+              c.remainingMs -= delta;
+              if (c.remainingMs <= 0) {
+                c.remainingMs = 0;
+                c.running = false;
+                if (!c.finished) {
+                  c.finished = true;
+                  _onTimerFinished();
+                }
+              }
+            } else {
+              c.elapsedMs += delta;
+            }
+          } else if (c.running) {
+            c.lastTick = t;
+          }
+        }
+      });
+    });
+  }
+
+  Future<void> _loadSaved() async {
+    final prefs = await SharedPreferences.getInstance();
+    for (int i = 0; i < 4; i++) {
+      final raw = prefs.getString('channel_$i');
+      if (raw != null) {
+        // 아주 단순한 저장 포맷: key=value;key=value
+        final map = <String, dynamic>{};
+        for (final pair in raw.split(';')) {
+          if (pair.isEmpty) continue;
+          final kv = pair.split('=');
+          if (kv.length != 2) continue;
+          final key = kv[0];
+          final val = kv[1];
+          if (key == 'isCountdown') {
+            map[key] = val == 'true';
+          } else {
+            map[key] = int.tryParse(val) ?? 0;
+          }
+        }
+        setState(() {
+          channels[i] = ChannelState.fromJson(map);
+        });
+      }
+    }
+  }
+
+  Future<void> _saveChannel(int index) async {
+    final prefs = await SharedPreferences.getInstance();
+    final c = channels[index];
+    final str = 'isCountdown=${c.isCountdown};elapsedMs=${c.elapsedMs};'
+        'setDurationMs=${c.setDurationMs};remainingMs=${c.remainingMs}';
+    await prefs.setString('channel_$index', str);
+  }
+
+  void _onTimerFinished() {
+    // 타이머 종료 시 알림음 + 진동성 피드백(플랫폼 기본 사운드)
+    SystemSound.play(SystemSoundType.alert);
+    HapticFeedback.vibrate();
+  }
+
+  @override
+  void dispose() {
+    ticker.cancel();
+    super.dispose();
+  }
+
+  ChannelState get current => channels[selected];
+
+  void _toggleStartStop() {
+    setState(() {
+      if (!current.running && current.isCountdown && current.remainingMs <= 0) {
+        // 다 끝난 타이머를 다시 시작하면 처음 설정값으로 리셋 후 시작
+        current.remainingMs = current.setDurationMs;
+        current.finished = false;
+      }
+      current.running = !current.running;
+      current.lastTick = current.running ? DateTime.now() : null;
+    });
+    _saveChannel(selected);
+  }
+
+  void _reset() {
+    setState(() {
+      current.reset();
+    });
+    _saveChannel(selected);
+  }
+
+  Future<void> _openSetTimeDialog() async {
+    final wasRunning = current.running;
+    if (wasRunning) {
+      setState(() => current.running = false);
+    }
+    final result = await showDialog<Duration>(
+      context: context,
+      builder: (context) => const _SetTimeDialog(),
+    );
+    if (result != null) {
+      setState(() {
+        // 모드 전환 시 이전 값이 남아있지 않도록 완전히 초기화
+        current.isCountdown = result.inMilliseconds > 0;
+        current.setDurationMs = result.inMilliseconds;
+        current.remainingMs = result.inMilliseconds;
+        current.elapsedMs = 0;
+        current.finished = false;
+        current.running = false;
+        current.lastTick = null;
+      });
+      _saveChannel(selected);
+    } else if (wasRunning) {
+      setState(() {
+        current.running = true;
+        current.lastTick = DateTime.now();
+      });
+    }
+  }
+
+  String _fmt(int ms, {bool withMillis = true}) {
+    if (ms < 0) ms = 0;
+    final h = ms ~/ 3600000;
+    final m = (ms % 3600000) ~/ 60000;
+    final s = (ms % 60000) ~/ 1000;
+    final cs = (ms % 1000) ~/ 10; // centisecond (00~99)
+    final hh = h.toString().padLeft(2, '0');
+    final mm = m.toString().padLeft(2, '0');
+    final ss = s.toString().padLeft(2, '0');
+    final ccss = cs.toString().padLeft(2, '0');
+    if (h > 0) {
+      return withMillis ? '$hh:$mm:$ss.$ccss' : '$hh:$mm:$ss';
+    }
+    return withMillis ? '$mm:$ss.$ccss' : '$mm:$ss';
+  }
+
+  String _fmtClock(DateTime t) {
+    return '${t.hour.toString().padLeft(2, '0')}:'
+        '${t.minute.toString().padLeft(2, '0')}:'
+        '${t.second.toString().padLeft(2, '0')}';
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = current;
+    final isRunning = c.running;
+    final isFinished = c.isCountdown && c.remainingMs <= 0 && !isRunning;
+
+    return Scaffold(
+      body: SafeArea(
+        child: Column(
+          children: [
+            // 상단: 현재 시각
+            Padding(
+              padding: const EdgeInsets.only(top: 12, bottom: 4),
+              child: Text(
+                _fmtClock(now),
+                style: const TextStyle(
+                  fontSize: 28,
+                  color: Colors.grey,
+                  fontFeatures: [FontFeature.tabularFigures()],
+                  fontWeight: FontWeight.w300,
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            // 채널 선택 탭 (T1~T4)
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Row(
+                children: List.generate(4, (i) {
+                  final ch = channels[i];
+                  final isSel = i == selected;
+                  final chRunning = ch.running;
+                  return Expanded(
+                    child: GestureDetector(
+                      onTap: () => setState(() => selected = i),
+                      child: Container(
+                        margin: const EdgeInsets.symmetric(horizontal: 4),
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        decoration: BoxDecoration(
+                          color: isSel
+                              ? Colors.greenAccent.withOpacity(0.15)
+                              : Colors.grey.withOpacity(0.08),
+                          border: Border.all(
+                            color: isSel
+                                ? Colors.greenAccent
+                                : Colors.grey.shade800,
+                            width: isSel ? 2 : 1,
+                          ),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Column(
+                          children: [
+                            Text(
+                              'T${i + 1}',
+                              style: TextStyle(
+                                fontSize: 20,
+                                fontWeight: FontWeight.bold,
+                                color: isSel ? Colors.greenAccent : Colors.white70,
+                              ),
+                            ),
+                            const SizedBox(height: 2),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                if (chRunning)
+                                  Container(
+                                    width: 8,
+                                    height: 8,
+                                    margin: const EdgeInsets.only(right: 4),
+                                    decoration: const BoxDecoration(
+                                      color: Colors.redAccent,
+                                      shape: BoxShape.circle,
+                                    ),
+                                  ),
+                                Text(
+                                  _fmt(ch.displayMs, withMillis: false),
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.white54,
+                                    fontFeatures: [FontFeature.tabularFigures()],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  );
+                }),
+              ),
+            ),
+            const Spacer(),
+            // 메인 디스플레이 (크게)
+            Column(
+              children: [
+                Text(
+                  c.isCountdown ? '타이머 (T${selected + 1})' : '스탑워치 (T${selected + 1})',
+                  style: TextStyle(
+                    fontSize: 20,
+                    color: isFinished ? Colors.redAccent : Colors.grey,
+                    letterSpacing: 1.5,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                GestureDetector(
+                  onTap: _openSetTimeDialog,
+                  child: FittedBox(
+                    child: Text(
+                      _fmt(c.displayMs),
+                      style: TextStyle(
+                        fontSize: 96,
+                        fontWeight: FontWeight.bold,
+                        fontFeatures: const [FontFeature.tabularFigures()],
+                        color: isFinished
+                            ? Colors.redAccent
+                            : (isRunning ? Colors.greenAccent : Colors.white),
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '숫자를 탭하면 시간 설정',
+                  style: TextStyle(fontSize: 13, color: Colors.grey.shade600),
+                ),
+              ],
+            ),
+            const Spacer(),
+            // 컨트롤 버튼
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 24),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: SizedBox(
+                      height: 72,
+                      child: OutlinedButton(
+                        onPressed: _reset,
+                        style: OutlinedButton.styleFrom(
+                          side: const BorderSide(color: Colors.grey, width: 2),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: const Text('리셋',
+                            style: TextStyle(fontSize: 22, color: Colors.white70)),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 16),
+                  Expanded(
+                    flex: 2,
+                    child: SizedBox(
+                      height: 72,
+                      child: ElevatedButton(
+                        onPressed: _toggleStartStop,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor:
+                              isRunning ? Colors.redAccent : Colors.greenAccent,
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(16),
+                          ),
+                        ),
+                        child: Text(
+                          isRunning ? '정지' : (c.elapsedMs > 0 || c.remainingMs != c.setDurationMs ? '재개' : '시작'),
+                          style: const TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.black,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 시간 설정 다이얼로그 (타이머 모드로 전환할 때 사용)
+class _SetTimeDialog extends StatefulWidget {
+  const _SetTimeDialog();
+
+  @override
+  State<_SetTimeDialog> createState() => _SetTimeDialogState();
+}
+
+class _SetTimeDialogState extends State<_SetTimeDialog> {
+  int h = 0;
+  int m = 5;
+  int s = 0;
+
+  Widget _picker(String label, int value, int max, ValueChanged<int> onChanged) {
+    return Column(
+      children: [
+        Text(label, style: const TextStyle(color: Colors.grey)),
+        SizedBox(
+          height: 100,
+          width: 70,
+          child: ListWheelScrollView.useDelegate(
+            itemExtent: 40,
+            perspective: 0.005,
+            diameterRatio: 1.2,
+            physics: const FixedExtentScrollPhysics(),
+            controller: FixedExtentScrollController(initialItem: value),
+            onSelectedItemChanged: onChanged,
+            childDelegate: ListWheelChildBuilderDelegate(
+              childCount: max,
+              builder: (context, index) => Center(
+                child: Text(
+                  index.toString().padLeft(2, '0'),
+                  style: const TextStyle(fontSize: 26, color: Colors.white),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      backgroundColor: const Color(0xFF1a1a1a),
+      title: const Text('타이머 시간 설정', style: TextStyle(color: Colors.white)),
+      content: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _picker('시', h, 24, (v) => h = v),
+          const SizedBox(width: 8),
+          _picker('분', m, 60, (v) => m = v),
+          const SizedBox(width: 8),
+          _picker('초', s, 60, (v) => s = v),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context, Duration.zero),
+          child: const Text('스탑워치로 사용 (시간 없음)'),
+        ),
+        ElevatedButton(
+          onPressed: () => Navigator.pop(
+            context,
+            Duration(hours: h, minutes: m, seconds: s),
+          ),
+          child: const Text('설정'),
+        ),
+      ],
+    );
+  }
+}
+
+/// ===================== Plate 분주 위치 추적 =====================
+
+class PlateConfig {
+  final String name;
+  final int rows;
+  final int cols;
+  const PlateConfig(this.name, this.rows, this.cols);
+}
+
+const List<PlateConfig> kPlateConfigs = [
+  PlateConfig('6 Well', 2, 3),
+  PlateConfig('12 Well', 3, 4),
+  PlateConfig('24 Well', 4, 6),
+  PlateConfig('48 Well', 6, 8),
+  PlateConfig('96 Well', 8, 12),
+  PlateConfig('384 Well', 16, 24),
+];
+
+class PlateTrackerPage extends StatefulWidget {
+  const PlateTrackerPage({super.key});
+
+  @override
+  State<PlateTrackerPage> createState() => _PlateTrackerPageState();
+}
+
+class _PlateTrackerPageState extends State<PlateTrackerPage> {
+  int configIndex = 4; // 기본값 96 Well
+  Set<int> marked = {};
+  bool? dragSelecting; // 드래그 시작 시 "선택 모드"인지 "해제 모드"인지
+  Size? gridSize;
+
+  PlateConfig get config => kPlateConfigs[configIndex];
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('plate_${config.name}');
+    setState(() {
+      marked = (raw == null || raw.isEmpty)
+          ? <int>{}
+          : raw.split(',').map(int.parse).toSet();
+    });
+  }
+
+  Future<void> _save() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('plate_${config.name}', marked.join(','));
+  }
+
+  void _handlePointer(Offset localPos) {
+    final size = gridSize;
+    if (size == null || size.width <= 0 || size.height <= 0) return;
+    final cellW = size.width / config.cols;
+    final cellH = size.height / config.rows;
+    if (localPos.dx < 0 ||
+        localPos.dy < 0 ||
+        localPos.dx >= size.width ||
+        localPos.dy >= size.height) {
+      return; // 그리드 영역 밖으로 손가락이 나가면 무시
+    }
+    final col = (localPos.dx / cellW).floor().clamp(0, config.cols - 1);
+    final row = (localPos.dy / cellH).floor().clamp(0, config.rows - 1);
+    final idx = row * config.cols + col;
+
+    dragSelecting ??= !marked.contains(idx);
+
+    setState(() {
+      if (dragSelecting == true) {
+        marked.add(idx);
+      } else {
+        marked.remove(idx);
+      }
+    });
+  }
+
+  void _endDrag() {
+    dragSelecting = null;
+    _save();
+  }
+
+  Future<void> _confirmReset() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1a1a1a),
+        title: const Text('전체 초기화', style: TextStyle(color: Colors.white)),
+        content: Text(
+          '${config.name} 플레이트의 선택을 모두 지울까요?',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('취소'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            child: const Text('초기화'),
+          ),
+        ],
+      ),
+    );
+    if (ok == true) {
+      setState(() => marked.clear());
+      _save();
+    }
+  }
+
+  String _rowLabel(int r) => String.fromCharCode(65 + r); // A, B, C ...
+
+  @override
+  Widget build(BuildContext context) {
+    const labelSize = 22.0;
+
+    return SafeArea(
+      child: Column(
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+            child: Row(
+              children: [
+                const Text(
+                  'Plate 분주 위치',
+                  style: TextStyle(
+                    fontSize: 20,
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                  ),
+                ),
+                const Spacer(),
+                DropdownButton<int>(
+                  value: configIndex,
+                  dropdownColor: const Color(0xFF1a1a1a),
+                  style: const TextStyle(color: Colors.greenAccent, fontSize: 16),
+                  underline: Container(height: 1, color: Colors.grey.shade700),
+                  items: [
+                    for (int i = 0; i < kPlateConfigs.length; i++)
+                      DropdownMenuItem(
+                        value: i,
+                        child: Text(kPlateConfigs[i].name),
+                      ),
+                  ],
+                  onChanged: (i) {
+                    if (i == null) return;
+                    setState(() => configIndex = i);
+                    _load();
+                  },
+                ),
+              ],
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: Row(
+              children: [
+                Text(
+                  '${marked.length} / ${config.rows * config.cols} 완료',
+                  style: const TextStyle(color: Colors.grey, fontSize: 14),
+                ),
+                const Spacer(),
+                TextButton.icon(
+                  onPressed: _confirmReset,
+                  icon: const Icon(Icons.refresh, color: Colors.redAccent, size: 18),
+                  label: const Text('초기화', style: TextStyle(color: Colors.redAccent)),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+              child: Column(
+                children: [
+                  // 열 번호 헤더
+                  Row(
+                    children: [
+                      const SizedBox(width: labelSize),
+                      Expanded(
+                        child: Row(
+                          children: List.generate(
+                            config.cols,
+                            (c) => Expanded(
+                              child: Center(
+                                child: Text(
+                                  '${c + 1}',
+                                  style: const TextStyle(color: Colors.grey, fontSize: 11),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  // 행 라벨 + 그리드 본체
+                  Expanded(
+                    child: Row(
+                      children: [
+                        SizedBox(
+                          width: labelSize,
+                          child: Column(
+                            children: List.generate(
+                              config.rows,
+                              (r) => Expanded(
+                                child: Center(
+                                  child: Text(
+                                    _rowLabel(r),
+                                    style: const TextStyle(color: Colors.grey, fontSize: 11),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                        Expanded(
+                          child: GestureDetector(
+                            behavior: HitTestBehavior.opaque,
+                            onPanDown: (d) => _handlePointer(d.localPosition),
+                            onPanUpdate: (d) => _handlePointer(d.localPosition),
+                            onPanEnd: (_) => _endDrag(),
+                            onPanCancel: _endDrag,
+                            child: LayoutBuilder(
+                              builder: (context, constraints) {
+                                gridSize = Size(constraints.maxWidth, constraints.maxHeight);
+                                return GridView.builder(
+                                  physics: const NeverScrollableScrollPhysics(),
+                                  gridDelegate:
+                                      SliverGridDelegateWithFixedCrossAxisCount(
+                                    crossAxisCount: config.cols,
+                                    childAspectRatio: 1,
+                                    mainAxisSpacing: 2,
+                                    crossAxisSpacing: 2,
+                                  ),
+                                  itemCount: config.rows * config.cols,
+                                  itemBuilder: (context, index) {
+                                    final isMarked = marked.contains(index);
+                                    return Container(
+                                      decoration: BoxDecoration(
+                                        color: isMarked
+                                            ? Colors.greenAccent
+                                            : Colors.grey.shade900,
+                                        border: Border.all(
+                                          color: Colors.grey.shade700,
+                                          width: 0.5,
+                                        ),
+                                        borderRadius: BorderRadius.circular(3),
+                                      ),
+                                    );
+                                  },
+                                );
+                              },
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
